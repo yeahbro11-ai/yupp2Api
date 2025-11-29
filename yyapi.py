@@ -16,7 +16,7 @@ from pydantic import BaseModel, Field
 
 
 def create_requests_session():
-    """创建配置好的 requests session"""
+    """Create a configured requests session with proxy disabled"""
     session = requests.Session()
     session.proxies = {"http": None, "https": None}
     adapter = requests.adapters.HTTPAdapter(max_retries=3)
@@ -103,8 +103,8 @@ class StreamResponse(BaseModel):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """应用启动和关闭时的生命周期管理"""
-    # 启动时执行
+    """Application startup and shutdown lifecycle management"""
+    # Startup
     print("Starting Yupp.ai OpenAI API Adapter server...")
     load_client_api_keys()
     load_yupp_accounts()
@@ -112,7 +112,7 @@ async def lifespan(app: FastAPI):
     print("Server initialization completed.")
 
     yield
-    # 关闭时执行
+    # Shutdown
     print("Server shutdown completed.")
 
 
@@ -130,7 +130,7 @@ security = HTTPBearer(auto_error=False)
 
 
 def log_debug(message: str):
-    """Debug日志函数"""
+    """Debug logging function"""
     if DEBUG_MODE:
         print(f"[DEBUG] {message}")
 
@@ -148,7 +148,7 @@ def load_client_api_keys():
         return
 
     try:
-        # 支持逗号分隔的多个密钥
+        # Support multiple keys separated by commas
         keys = [key.strip() for key in env_keys.split(",") if key.strip()]
         VALID_CLIENT_KEYS = set(keys)
         print(
@@ -170,7 +170,7 @@ def load_yupp_accounts():
         return
 
     try:
-        # 支持逗号分隔的多个token
+        # Support multiple tokens separated by commas
         tokens = [token.strip() for token in env_tokens.split(",") if token.strip()]
         for token in tokens:
             YUPP_ACCOUNTS.append(
@@ -193,30 +193,30 @@ def load_yupp_models():
     global YUPP_MODELS
     model_file = os.getenv("MODEL_FILE", "./model/model.json")
 
-    # 检查模型文件是否存在
+    # Ensure the model file exists
     if not os.path.exists(model_file):
-        print(f"模型文件 {model_file} 不存在，尝试自动获取模型数据...")
+        print(f"Model file {model_file} not found. Attempting to fetch model data automatically...")
         try:
-            # 导入并调用 model.py 中的函数
+            # Import and invoke helper from model.py
             from model import fetch_and_save_models
 
             success = fetch_and_save_models(model_file)
             if success:
-                print(f"成功自动获取并保存模型数据到 {model_file}")
+                print(f"Automatically fetched and saved model data to {model_file}.")
             else:
-                print(f"自动获取模型数据失败，将使用空的模型列表")
+                print("Automatic model fetch failed. Proceeding with an empty model list.")
                 YUPP_MODELS = []
                 return
         except ImportError as e:
-            print(f"无法导入 model.py 模块: {e}")
+            print(f"Unable to import model.py module: {e}")
             YUPP_MODELS = []
             return
         except Exception as e:
-            print(f"自动获取模型数据时发生错误: {e}")
+            print(f"Error while fetching model data automatically: {e}")
             YUPP_MODELS = []
             return
 
-    # 加载模型文件
+    # Load the model file content
     try:
         with open(model_file, "r", encoding="utf-8") as f:
             YUPP_MODELS = json.load(f)
@@ -269,10 +269,10 @@ def get_best_yupp_account() -> Optional[YuppAccount]:
 
 
 def format_messages_for_yupp(messages: List[ChatMessage]) -> str:
-    """将多轮对话格式化为Yupp单轮对话格式"""
+    """Format multi-turn conversation into Yupp's single-turn format"""
     formatted = []
 
-    # 处理系统消息
+    # Process system messages
     system_messages = [msg for msg in messages if msg.role == "system"]
     if system_messages:
         for sys_msg in system_messages:
@@ -283,7 +283,7 @@ def format_messages_for_yupp(messages: List[ChatMessage]) -> str:
             )
             formatted.append(content)
 
-    # 处理用户和助手消息
+    # Process user and assistant messages
     user_assistant_msgs = [msg for msg in messages if msg.role != "system"]
     for msg in user_assistant_msgs:
         role = "Human" if msg.role == "user" else "Assistant"
@@ -292,12 +292,12 @@ def format_messages_for_yupp(messages: List[ChatMessage]) -> str:
         )
         formatted.append(f"\n\n{role}: {content}")
 
-    # 确保以Assistant:结尾
+    # Ensure it ends with "Assistant:"
     if not formatted or not formatted[-1].strip().startswith("Assistant:"):
         formatted.append("\n\nAssistant:")
 
     result = "".join(formatted)
-    # 如果以\n\n开头，则删除
+    # Strip leading double newline if present
     if result.startswith("\n\n"):
         result = result[2:]
 
@@ -351,7 +351,7 @@ async def list_models_no_auth():
 
 
 def claim_yupp_reward(account: YuppAccount, reward_id: str):
-    """同步领取Yupp奖励"""
+    """Claim a pending Yupp reward synchronously"""
     try:
         log_debug(f"Claiming reward {reward_id}...")
         url = "https://yupp.ai/api/trpc/reward.claim?batch=1"
@@ -377,26 +377,26 @@ def claim_yupp_reward(account: YuppAccount, reward_id: str):
 def yupp_stream_generator(
     response_lines, model_id: str, account: YuppAccount
 ) -> Generator[str, None, None]:
-    """处理Yupp的流式响应并转换为OpenAI格式"""
+    """Process Yupp streaming response and convert it to OpenAI format"""
     stream_id = f"chatcmpl-{uuid.uuid4().hex}"
     created_time = int(time.time())
 
-    # 清理模型名称，移除换行符和表情符号
+    # Clean model name: remove newlines and emojis
     def clean_model_name(model_name: str) -> str:
-        """清理模型名称，移除换行符和表情符号"""
+        """Clean model name by removing newlines and emojis"""
         if not model_name:
             return model_name
-        # 移除换行符和其他不可见字符
+        # Remove newlines and other invisible characters
         cleaned = re.sub(r"[\n\r\t\f\v]", " ", model_name)
-        # 移除表情符号和其他特殊字符
+        # Remove emojis and other special characters
         cleaned = re.sub(r"[^\w\s\-_\(\)\.\/\[\]]+", "", cleaned)
-        # 移除多余的空格
+        # Remove excess whitespace
         cleaned = re.sub(r"\s+", " ", cleaned).strip()
         return cleaned
 
     clean_model_id = clean_model_name(model_id)
 
-    # 发送初始角色
+    # Send initial role
     yield f"data: {StreamResponse(id=stream_id, created=created_time, model=clean_model_id, choices=[StreamChoice(delta={'role': 'assistant'})]).model_dump_json()}\n\n"
 
     line_pattern = re.compile(b"^([0-9a-fA-F]+):(.*)")
@@ -406,51 +406,51 @@ def yupp_stream_generator(
     is_thinking = False
     thinking_content = ""
     normal_content = ""
-    select_stream = [None, None]  # 初始化 select_stream
-    processed_content = set()  # 用于追踪已处理的内容，避免重复
+    select_stream = [None, None]  # Initialize select_stream
+    processed_content = set()  # Track processed content to avoid duplicates
 
     def extract_ref_id(ref):
-        """从引用字符串中提取ID，例如从'$@123'提取'123'"""
+        """Extract ID from reference string, e.g., extract '123' from '$@123'"""
         return (
             ref[2:] if ref and isinstance(ref, str) and ref.startswith("$@") else None
         )
 
     def is_valid_content(content: str) -> bool:
-        """检查内容是否有效，避免过度过滤"""
+        """Check if content is valid, avoiding over-filtering"""
         if not content or content in [None, "", "$undefined"]:
             return False
 
-        # 移除明显的系统消息
+        # Filter out obvious system messages
         if content.startswith("\\n\\<streaming stopped") or content.startswith(
             "\n\\<streaming stopped"
         ):
             return False
 
-        # 移除纯UUID（更宽松的检查）
+        # Filter out pure UUIDs
         if re.match(
             r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
             content.strip(),
         ):
             return False
 
-        # 移除过短的内容（但允许单字符）
+        # Filter out empty content
         if len(content.strip()) == 0:
             return False
 
-        # 移除明显的系统标记
+        # Filter out obvious system markers
         if content.strip() in ["$undefined", "undefined", "null", "NULL"]:
             return False
 
         return True
 
     def process_content_chunk(content: str, chunk_id: str):
-        """处理单个内容块"""
+        """Process a single content chunk"""
         nonlocal is_thinking, thinking_content, normal_content
 
         if not is_valid_content(content):
             return
 
-        # 避免重复处理相同的内容
+        # Avoid processing the same content twice
         content_hash = hash(content)
         if content_hash in processed_content:
             return
@@ -458,7 +458,7 @@ def yupp_stream_generator(
 
         log_debug(f"Processing chunk {chunk_id} with content: '{content[:50]}...'")
 
-        # 处理思考过程
+        # Handle thinking process
         if "<think>" in content or "</think>" in content:
             yield from process_thinking_content(content)
         elif is_thinking:
@@ -469,12 +469,12 @@ def yupp_stream_generator(
             yield f"data: {StreamResponse(id=stream_id, created=created_time, model=clean_model_id, choices=[StreamChoice(delta={'content': content})]).model_dump_json()}\n\n"
 
     def process_thinking_content(content: str):
-        """处理包含思考标签的内容"""
+        """Process content containing thinking tags"""
         nonlocal is_thinking, thinking_content, normal_content
 
         if "<think>" in content:
             parts = content.split("<think>", 1)
-            if parts[0]:  # 思考标签前的内容
+            if parts[0]:  # Content before thinking tag
                 normal_content += parts[0]
                 yield f"data: {StreamResponse(id=stream_id, created=created_time, model=clean_model_id, choices=[StreamChoice(delta={'content': parts[0]})]).model_dump_json()}\n\n"
 
@@ -487,7 +487,7 @@ def yupp_stream_generator(
                 yield f"data: {StreamResponse(id=stream_id, created=created_time, model=clean_model_id, choices=[StreamChoice(delta={'reasoning_content': think_parts[0]})]).model_dump_json()}\n\n"
 
                 is_thinking = False
-                if think_parts[1]:  # 思考标签后的内容
+                if think_parts[1]:  # Content after thinking tag
                     normal_content += think_parts[1]
                     yield f"data: {StreamResponse(id=stream_id, created=created_time, model=clean_model_id, choices=[StreamChoice(delta={'content': think_parts[1]})]).model_dump_json()}\n\n"
             else:
@@ -500,7 +500,7 @@ def yupp_stream_generator(
             yield f"data: {StreamResponse(id=stream_id, created=created_time, model=clean_model_id, choices=[StreamChoice(delta={'reasoning_content': parts[0]})]).model_dump_json()}\n\n"
 
             is_thinking = False
-            if parts[1]:  # 思考标签后的内容
+            if parts[1]:  # Content after thinking tag
                 normal_content += parts[1]
                 yield f"data: {StreamResponse(id=stream_id, created=created_time, model=clean_model_id, choices=[StreamChoice(delta={'content': parts[1]})]).model_dump_json()}\n\n"
 
@@ -531,12 +531,12 @@ def yupp_stream_generator(
                 log_debug(f"Failed to parse JSON for chunk {chunk_id}: {chunk_data}")
                 continue
 
-            # 处理奖励信息
+            # Handle reward information
             if chunk_id == "a":
                 reward_info = data
                 log_debug(f"Found reward info: {reward_info}")
 
-            # 处理初始设置信息
+            # Handle initial stream setup
             elif chunk_id == "1":
                 if isinstance(data, dict):
                     left_stream = data.get("leftStream", {})
@@ -559,7 +559,7 @@ def yupp_stream_generator(
                                 log_debug(f"Found target stream ID: {target_stream_id}")
                             break
 
-            # 处理目标流内容
+            # Process target stream content
             elif target_stream_id and chunk_id == target_stream_id:
                 if isinstance(data, dict):
                     content = data.get("curr", "")
@@ -569,14 +569,14 @@ def yupp_stream_generator(
                         )
                         yield from process_content_chunk(content, chunk_id)
 
-                        # 更新目标流ID
+                        # Update target stream ID
                         target_stream_id = extract_ref_id(data.get("next"))
                         if target_stream_id:
                             log_debug(
                                 f"Updated target stream ID to: {target_stream_id}"
                             )
 
-            # 备用逻辑：处理任何包含"curr"的chunk
+            # Fallback: process any chunk containing "curr"
             elif isinstance(data, dict) and "curr" in data:
                 content = data.get("curr", "")
                 if content:
@@ -593,11 +593,11 @@ def yupp_stream_generator(
         yield f"data: {json.dumps({'error': str(e)})}\n\n"
 
     finally:
-        # 发送完成信号
+        # Send completion signal
         yield f"data: {StreamResponse(id=stream_id, created=created_time, model=clean_model_id, choices=[StreamChoice(delta={}, finish_reason='stop')]).model_dump_json()}\n\n"
         yield "data: [DONE]\n\n"
 
-        # 领取奖励
+        # Claim any pending reward
         if reward_info and "unclaimedRewardInfo" in reward_info:
             reward_id = reward_info["unclaimedRewardInfo"].get("rewardId")
             if reward_id:
@@ -614,12 +614,12 @@ def yupp_stream_generator(
 def build_yupp_non_stream_response(
     response_lines, model_id: str, account: YuppAccount
 ) -> ChatCompletionResponse:
-    """构建非流式响应"""
+    """Build a non-streaming response from Yupp stream events"""
     full_content = ""
     full_reasoning_content = ""
     reward_id = None
 
-    # 用于存储从流式响应中获取的模型名称
+    # Store model name extracted from the streaming response
     response_model_name = model_id
 
     for event in yupp_stream_generator(response_lines, model_id, account):
@@ -635,7 +635,7 @@ def build_yupp_non_stream_response(
                         status_code=500, detail=data["error"]["message"]
                     )
 
-                # 从第一个有效响应中获取模型名称（已经清理过）
+                # Extract model name from the first valid response (already cleaned)
                 if "model" in data and not response_model_name:
                     response_model_name = data["model"]
 
@@ -647,7 +647,7 @@ def build_yupp_non_stream_response(
             except json.JSONDecodeError:
                 continue
 
-    # 构建完整响应
+    # Build complete response
     return ChatCompletionResponse(
         model=response_model_name,
         choices=[
@@ -668,8 +668,8 @@ def build_yupp_non_stream_response(
 async def chat_completions(
     request: ChatCompletionRequest, _: None = Depends(authenticate_client)
 ):
-    """使用Yupp.ai创建聊天完成"""
-    # 查找模型
+    """Create chat completions by proxying requests to Yupp.ai"""
+    # Find the requested model
     model_info = next((m for m in YUPP_MODELS if m.get("label") == request.model), None)
     if not model_info:
         raise HTTPException(
@@ -691,11 +691,11 @@ async def chat_completions(
         f"Processing request for model: {request.model} (Yupp name: {model_name})"
     )
 
-    # 格式化消息
+    # Format messages for Yupp
     question = format_messages_for_yupp(request.messages)
     log_debug(f"Formatted question: {question[:100]}...")
 
-    # 尝试所有账户
+    # Try all available accounts
     for attempt in range(len(YUPP_ACCOUNTS)):
         account = get_best_yupp_account()
         if not account:
@@ -704,7 +704,7 @@ async def chat_completions(
             )
 
         try:
-            # 构建请求
+            # Build request payload
             url_uuid = str(uuid.uuid4())
             url = f"https://yupp.ai/chat/{url_uuid}?stream=true"
 
@@ -736,7 +736,7 @@ async def chat_completions(
                 f"Sending request to Yupp.ai with account token ending in ...{account['token'][-4:]}"
             )
 
-            # 发送请求
+            # Send request
             session = create_requests_session()
             response = session.post(
                 url,
@@ -746,7 +746,7 @@ async def chat_completions(
             )
             response.raise_for_status()
 
-            # 处理响应
+            # Handle response
             if request.stream:
                 log_debug("Returning processed response stream")
                 return StreamingResponse(
@@ -784,7 +784,7 @@ async def chat_completions(
                         f"Account ...{account['token'][-4:]} error count: {account['error_count']}"
                     )
                 else:
-                    # 客户端错误，不尝试使用其他账户
+                    # Client error; do not try other accounts
                     raise HTTPException(status_code=status_code, detail=error_detail)
 
         except Exception as e:
@@ -792,39 +792,39 @@ async def chat_completions(
             with account_rotation_lock:
                 account["error_count"] += 1
 
-    # 所有尝试都失败
+    # All attempts failed
     raise HTTPException(
         status_code=503, detail="All attempts to contact Yupp.ai API failed."
     )
 
 
 def main():
-    """主函数：启动 Yupp.ai OpenAI API Adapter 服务"""
+    """Entry point: start the Yupp.ai OpenAI API Adapter service"""
     import uvicorn
     from dotenv import load_dotenv
 
-    # 加载环境变量
+    # Load environment variables
     load_dotenv()
 
-    # 设置全局配置
+    # Configure global settings
     global DEBUG_MODE
     DEBUG_MODE = os.environ.get("DEBUG_MODE", "false").lower() == "true"
 
     if DEBUG_MODE:
         print("Debug mode enabled")
 
-    # 检查必要的环境变量
+    # Validate required environment variables
     if not os.getenv("CLIENT_API_KEYS"):
         print("Warning: CLIENT_API_KEYS environment variable not set.")
     if not os.getenv("YUPP_TOKENS"):
         print("Warning: YUPP_TOKENS environment variable not set.")
 
-    # 加载配置
+    # Load configuration
     load_client_api_keys()
     load_yupp_accounts()
     load_yupp_models()
 
-    # 显示启动信息
+    # Display startup info
     print("\n--- Yupp.ai OpenAI API Adapter ---")
     print(f"Debug Mode: {DEBUG_MODE}")
     print("Endpoints:")
@@ -848,7 +848,7 @@ def main():
         print(f"Yupp.ai Models: None loaded. Check {model_file}.")
     print("------------------------------------")
 
-    # 启动服务器
+    # Start server
     host = os.getenv("HOST", "0.0.0.0")
     port = int(os.getenv("PORT", "8001"))
 

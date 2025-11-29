@@ -9,10 +9,10 @@ services:
     ports:
       - "${PORT:-8001}:${PORT:-8001}"
     volumes:
-      # 挂载模型配置目录
+      # Mount model configuration directory
       - ./model:/app/model
     environment:
-      # 从 .env 文件加载环境变量
+      # Load environment variables from .env
       - CLIENT_API_KEYS=${CLIENT_API_KEYS}
       - YUPP_TOKENS=${YUPP_TOKENS}
       - HOST=${HOST:-0.0.0.0}
@@ -22,7 +22,7 @@ services:
       - ERROR_COOLDOWN=${ERROR_COOLDOWN:-300}
       - MODEL_FILE=${MODEL_FILE:-./model/model.json}
       - PYTHONUNBUFFERED=1
-      # 代理配置（可选）
+      # Optional proxy configuration
       - HTTP_PROXY=${HTTP_PROXY:-}
       - HTTPS_PROXY=${HTTPS_PROXY:-}
       - NO_PROXY=${NO_PROXY:-*}
