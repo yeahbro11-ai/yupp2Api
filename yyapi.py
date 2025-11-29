@@ -6,12 +6,15 @@ import uuid
 import threading
 from contextlib import asynccontextmanager
 from typing import Any, Dict, List, Optional, TypedDict, Union, Generator
+from datetime import datetime
+from pathlib import Path
 import requests
-from fastapi import FastAPI, HTTPException, Depends, Query
-from fastapi.responses import StreamingResponse
+from fastapi import FastAPI, HTTPException, Depends, Query, Form, Request
+from fastapi.responses import StreamingResponse, HTMLResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, Field
 
 
@@ -32,11 +35,21 @@ class YuppAccount(TypedDict):
     error_count: int
 
 
+class AdminAuthResult(TypedDict):
+    token: str
+    from_query: bool
+
+
 VALID_CLIENT_KEYS: set = set()
 YUPP_ACCOUNTS: List[YuppAccount] = []
 YUPP_MODELS: List[Dict[str, Any]] = []
 account_rotation_lock = threading.Lock()
 DEBUG_MODE = False
+APP_START_TIME = time.time()
+ADMIN_DASHBOARD_TOKEN = ""
+
+templates_dir = Path(__file__).parent / "templates"
+templates = Jinja2Templates(directory=str(templates_dir))
 
 
 class ChatMessage(BaseModel):
@@ -105,7 +118,10 @@ class StreamResponse(BaseModel):
 async def lifespan(app: FastAPI):
     """应用启动和关闭时的生命周期管理"""
     # 启动时执行
+    global APP_START_TIME
+    APP_START_TIME = time.time()
     print("Starting Yupp.ai OpenAI API Adapter server...")
+    refresh_runtime_settings()
     load_client_api_keys()
     load_yupp_accounts()
     load_yupp_models()
@@ -133,6 +149,13 @@ def log_debug(message: str):
     """Debug日志函数"""
     if DEBUG_MODE:
         print(f"[DEBUG] {message}")
+
+
+def refresh_runtime_settings():
+    """Refresh global runtime settings from environment variables"""
+    global DEBUG_MODE, ADMIN_DASHBOARD_TOKEN
+    DEBUG_MODE = os.environ.get("DEBUG_MODE", "false").lower() == "true"
+    ADMIN_DASHBOARD_TOKEN = os.getenv("ADMIN_DASHBOARD_TOKEN", "")
 
 
 def load_client_api_keys():
@@ -348,6 +371,333 @@ async def list_v1_models(_: None = Depends(authenticate_client)):
 async def list_models_no_auth():
     """List available models without authentication - for client compatibility"""
     return get_models_list_response()
+
+
+async def authenticate_admin(
+    request: Request,
+    token: Optional[str] = Query(None),
+    auth: Optional[HTTPAuthorizationCredentials] = Depends(security),
+) -> AdminAuthResult:
+    """Authenticate admin dashboard access via Authorization header, cookie, or query param"""
+    if not ADMIN_DASHBOARD_TOKEN:
+        raise HTTPException(
+            status_code=503,
+            detail="Admin dashboard not configured. Set ADMIN_DASHBOARD_TOKEN environment variable.",
+        )
+    
+    provided_token = None
+    from_query = False
+    
+    if auth and auth.credentials:
+        provided_token = auth.credentials
+    elif token:
+        provided_token = token
+        from_query = True
+    else:
+        cookies = request.cookies
+        provided_token = cookies.get("admin_token")
+    
+    if not provided_token or provided_token != ADMIN_DASHBOARD_TOKEN:
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid or missing admin token. Provide via Authorization header, cookie, or ?token= query parameter.",
+        )
+    
+    return {"token": provided_token, "from_query": from_query}
+
+
+def format_uptime(seconds: float) -> str:
+    """Format uptime in human-readable format"""
+    days = int(seconds // 86400)
+    hours = int((seconds % 86400) // 3600)
+    minutes = int((seconds % 3600) // 60)
+    secs = int(seconds % 60)
+    
+    parts = []
+    if days > 0:
+        parts.append(f"{days}d")
+    if hours > 0:
+        parts.append(f"{hours}h")
+    if minutes > 0:
+        parts.append(f"{minutes}m")
+    if secs > 0 or not parts:
+        parts.append(f"{secs}s")
+    
+    return " ".join(parts)
+
+
+def format_timestamp(timestamp: float) -> str:
+    """Format timestamp in human-readable format"""
+    if timestamp == 0:
+        return "Never"
+    dt = datetime.fromtimestamp(timestamp)
+    now = datetime.now()
+    diff = now - dt
+    
+    if diff.total_seconds() < 60:
+        return "Just now"
+    elif diff.total_seconds() < 3600:
+        return f"{int(diff.total_seconds() // 60)}m ago"
+    elif diff.total_seconds() < 86400:
+        return f"{int(diff.total_seconds() // 3600)}h ago"
+    else:
+        return dt.strftime("%Y-%m-%d %H:%M")
+
+
+def get_proxy_status() -> str:
+    """Return a readable proxy status string"""
+    http_proxy = os.getenv("HTTP_PROXY")
+    https_proxy = os.getenv("HTTPS_PROXY")
+    no_proxy = os.getenv("NO_PROXY")
+    if http_proxy or https_proxy:
+        proxies = []
+        if http_proxy:
+            proxies.append("HTTP proxy configured")
+        if https_proxy:
+            proxies.append("HTTPS proxy configured")
+        return ", ".join(proxies)
+    if no_proxy:
+        return f"Direct (NO_PROXY={no_proxy})"
+    return "Direct (no proxy configured)"
+
+
+def sanitize_label(label: str) -> str:
+    """Collapse multiline labels into a single readable line"""
+    if not label:
+        return ""
+    parts = [part.strip() for part in label.splitlines() if part.strip()]
+    return " | ".join(parts) if parts else label.strip()
+
+
+def build_model_tags(model: Dict[str, Any]) -> List[str]:
+    """Create a list of friendly tags for a model"""
+    tag_map = {
+        "isPro": "Pro",
+        "isMax": "Max",
+        "isNew": "New",
+        "isLive": "Live",
+        "isAgent": "Agent",
+        "isFast": "Fast",
+        "isReasoning": "Reasoning",
+        "isImageGeneration": "Image Gen",
+    }
+    tags = [label for key, label in tag_map.items() if model.get(key)]
+    return tags
+
+
+def get_model_catalog_for_view() -> List[Dict[str, Any]]:
+    """Return processed model records for UI rendering"""
+    catalog: List[Dict[str, Any]] = []
+    for model in YUPP_MODELS:
+        model_id = model.get("label", model.get("id", "unknown"))
+        catalog.append(
+            {
+                "id": model_id,
+                "label": sanitize_label(model_id),
+                "name": model.get("name") or sanitize_label(model.get("shortLabel", "")) or model_id,
+                "publisher": model.get("publisher") or "Unknown",
+                "description": model.get("family") or model.get("shortLabel") or "",
+                "tags": build_model_tags(model),
+            }
+        )
+    return catalog
+
+
+def get_model_options_for_select() -> List[Dict[str, str]]:
+    """Return select options for the test console"""
+    options: List[Dict[str, str]] = []
+    for model in YUPP_MODELS:
+        model_id = model.get("label", model.get("id", "unknown"))
+        options.append(
+            {
+                "value": model_id,
+                "display": sanitize_label(model_id),
+                "publisher": model.get("publisher") or "Unknown",
+            }
+        )
+    return options
+
+
+def set_admin_cookie(response, auth: AdminAuthResult):
+    """Persist admin token in a cookie when provided via query parameter"""
+    if auth.get("from_query"):
+        response.set_cookie(
+            key="admin_token",
+            value=auth["token"],
+            httponly=True,
+            max_age=3600 * 24 * 7,
+            samesite="lax",
+        )
+
+
+@app.get("/admin", response_class=HTMLResponse)
+async def admin_dashboard(
+    request: Request,
+    auth: AdminAuthResult = Depends(authenticate_admin),
+):
+    """Admin dashboard landing page"""
+    response = templates.TemplateResponse(
+        "admin/dashboard.html",
+        {
+            "request": request,
+            "active_page": "dashboard",
+        },
+    )
+    set_admin_cookie(response, auth)
+    return response
+
+
+@app.get("/admin/status", response_class=HTMLResponse)
+async def admin_status(
+    request: Request,
+    auth: AdminAuthResult = Depends(authenticate_admin),
+):
+    """Admin status page showing service health and configuration"""
+    uptime_seconds = time.time() - APP_START_TIME
+    valid_accounts = sum(1 for acc in YUPP_ACCOUNTS if acc["is_valid"])
+    
+    accounts_info = []
+    for acc in YUPP_ACCOUNTS:
+        accounts_info.append({
+            "token_suffix": acc["token"][-4:] if len(acc["token"]) >= 4 else "***",
+            "is_valid": acc["is_valid"],
+            "error_count": acc["error_count"],
+            "last_used_str": format_timestamp(acc["last_used"]),
+        })
+    
+    response = templates.TemplateResponse(
+        "admin/status.html",
+        {
+            "request": request,
+            "active_page": "status",
+            "app_name": "Yupp.ai OpenAI API Adapter",
+            "version": os.getenv("APP_VERSION", "1.0.0"),
+            "env_name": os.getenv("APP_ENV_NAME", "production"),
+            "debug_mode": DEBUG_MODE,
+            "uptime": format_uptime(uptime_seconds),
+            "proxy_status": get_proxy_status(),
+            "yupp_accounts_count": len(YUPP_ACCOUNTS),
+            "valid_yupp_accounts": valid_accounts,
+            "client_keys_count": len(VALID_CLIENT_KEYS),
+            "models_count": len(YUPP_MODELS),
+            "accounts": accounts_info,
+        },
+    )
+    set_admin_cookie(response, auth)
+    return response
+
+
+@app.get("/admin/models", response_class=HTMLResponse)
+async def admin_models(
+    request: Request,
+    auth: AdminAuthResult = Depends(authenticate_admin),
+):
+    """Admin models page showing available models from model.json"""
+    models_display = get_model_catalog_for_view()
+    response = templates.TemplateResponse(
+        "admin/models.html",
+        {
+            "request": request,
+            "active_page": "models",
+            "models": models_display,
+        },
+    )
+    set_admin_cookie(response, auth)
+    return response
+
+
+@app.get("/admin/test", response_class=HTMLResponse)
+async def admin_test_console(
+    request: Request,
+    auth: AdminAuthResult = Depends(authenticate_admin),
+):
+    """Admin test console page for sending test requests"""
+    form_state = {
+        "model": "",
+        "system": "",
+        "message": "",
+        "temperature": "0.7",
+        "max_tokens": "512",
+    }
+    response = templates.TemplateResponse(
+        "admin/test.html",
+        {
+            "request": request,
+            "active_page": "test",
+            "models": get_model_options_for_select(),
+            "form_state": form_state,
+            "response_json": None,
+            "error_message": None,
+        },
+    )
+    set_admin_cookie(response, auth)
+    return response
+
+
+@app.post("/admin/test", response_class=HTMLResponse)
+async def admin_test_console_post(
+    request: Request,
+    model: str = Form(...),
+    message: str = Form(...),
+    system: str = Form(""),
+    temperature: float = Form(0.7),
+    max_tokens: int = Form(512),
+    auth: AdminAuthResult = Depends(authenticate_admin),
+):
+    """Handle test console form submission"""
+    form_state = {
+        "model": model,
+        "system": system,
+        "message": message,
+        "temperature": str(temperature),
+        "max_tokens": str(max_tokens),
+    }
+
+    response_json = None
+    error_message = None
+
+    try:
+        messages = []
+        if system:
+            messages.append(ChatMessage(role="system", content=system))
+        messages.append(ChatMessage(role="user", content=message))
+
+        chat_request = ChatCompletionRequest(
+            model=model,
+            messages=messages,
+            stream=False,
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
+
+        result = await execute_chat_completion(chat_request)
+        if isinstance(result, StreamingResponse):
+            error_message = "Streaming responses are not supported in the test console."
+        else:
+            response_json = json.dumps(
+                result.model_dump() if hasattr(result, "model_dump") else result,
+                indent=2,
+                ensure_ascii=False,
+            )
+
+    except HTTPException as e:
+        error_message = f"HTTP {e.status_code}: {e.detail}"
+    except Exception as e:
+        error_message = f"Error: {str(e)}"
+
+    response = templates.TemplateResponse(
+        "admin/test.html",
+        {
+            "request": request,
+            "active_page": "test",
+            "models": get_model_options_for_select(),
+            "form_state": form_state,
+            "response_json": response_json,
+            "error_message": error_message,
+        },
+    )
+    set_admin_cookie(response, auth)
+    return response
 
 
 def claim_yupp_reward(account: YuppAccount, reward_id: str):
@@ -664,11 +1014,8 @@ def build_yupp_non_stream_response(
     )
 
 
-@app.post("/v1/chat/completions")
-async def chat_completions(
-    request: ChatCompletionRequest, _: None = Depends(authenticate_client)
-):
-    """使用Yupp.ai创建聊天完成"""
+async def execute_chat_completion(request: ChatCompletionRequest):
+    """Core logic for handling chat completion requests"""
     # 查找模型
     model_info = next((m for m in YUPP_MODELS if m.get("label") == request.model), None)
     if not model_info:
@@ -798,6 +1145,14 @@ async def chat_completions(
     )
 
 
+@app.post("/v1/chat/completions")
+async def chat_completions(
+    request: ChatCompletionRequest, _: None = Depends(authenticate_client)
+):
+    """使用Yupp.ai创建聊天完成"""
+    return await execute_chat_completion(request)
+
+
 def main():
     """主函数：启动 Yupp.ai OpenAI API Adapter 服务"""
     import uvicorn
@@ -807,8 +1162,9 @@ def main():
     load_dotenv()
 
     # 设置全局配置
-    global DEBUG_MODE
-    DEBUG_MODE = os.environ.get("DEBUG_MODE", "false").lower() == "true"
+    global DEBUG_MODE, ADMIN_DASHBOARD_TOKEN, APP_START_TIME
+    APP_START_TIME = time.time()
+    refresh_runtime_settings()
 
     if DEBUG_MODE:
         print("Debug mode enabled")
@@ -831,6 +1187,10 @@ def main():
     print("  GET  /v1/models (Client API Key Auth)")
     print("  GET  /models (No Auth)")
     print("  POST /v1/chat/completions (Client API Key Auth)")
+    if ADMIN_DASHBOARD_TOKEN:
+        print("  GET  /admin (Admin Dashboard, Token Auth)")
+    else:
+        print("  Admin Dashboard: Disabled (set ADMIN_DASHBOARD_TOKEN to enable)")
 
     print(f"\nClient API Keys: {len(VALID_CLIENT_KEYS)}")
     if YUPP_ACCOUNTS:
