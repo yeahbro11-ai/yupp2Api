@@ -6,6 +6,7 @@ import uuid
 import threading
 from contextlib import asynccontextmanager
 from typing import Any, Dict, List, Optional, TypedDict, Union, Generator
+from enum import Enum
 import requests
 from fastapi import FastAPI, HTTPException, Depends, Query
 from fastapi.responses import StreamingResponse
@@ -25,11 +26,139 @@ def create_requests_session():
     return session
 
 
+class ErrorType(Enum):
+    """Classification of error types for better handling"""
+    AUTH_ERROR = "auth_error"           # 401, 403 - invalid token
+    RATE_LIMIT = "rate_limit"           # 429 - too many requests
+    SERVER_ERROR = "server_error"       # 500, 502, 503, 504 - upstream issues
+    NETWORK_ERROR = "network_error"     # Connection, timeout errors
+    CLIENT_ERROR = "client_error"       # 4xx client-side errors
+    STREAM_ERROR = "stream_error"       # Errors during streaming
+    PARSE_ERROR = "parse_error"         # JSON or response parsing errors
+    UNKNOWN_ERROR = "unknown_error"     # Catch-all
+
+
+def mask_token(token: str, visible_chars: int = 4) -> str:
+    """Safely mask a token for logging, showing only last N characters"""
+    if not token or len(token) <= visible_chars:
+        return "***"
+    return f"...{token[-visible_chars:]}"
+
+
+def classify_error(error: Exception) -> ErrorType:
+    """Classify an exception into an ErrorType for appropriate handling"""
+    if isinstance(error, requests.exceptions.HTTPError):
+        status_code = error.response.status_code
+        if status_code in [401, 403]:
+            return ErrorType.AUTH_ERROR
+        elif status_code == 429:
+            return ErrorType.RATE_LIMIT
+        elif status_code in [500, 502, 503, 504]:
+            return ErrorType.SERVER_ERROR
+        elif 400 <= status_code < 500:
+            return ErrorType.CLIENT_ERROR
+    elif isinstance(error, (requests.exceptions.ConnectionError, 
+                           requests.exceptions.Timeout,
+                           requests.exceptions.ConnectTimeout,
+                           requests.exceptions.ReadTimeout)):
+        return ErrorType.NETWORK_ERROR
+    elif isinstance(error, json.JSONDecodeError):
+        return ErrorType.PARSE_ERROR
+    
+    return ErrorType.UNKNOWN_ERROR
+
+
+def log_error(error_type: ErrorType, message: str, account_token: Optional[str] = None, 
+              endpoint: Optional[str] = None, exception: Optional[Exception] = None):
+    """Centralized error logging with context"""
+    masked_token = mask_token(account_token) if account_token else "N/A"
+    endpoint_str = endpoint if endpoint else "N/A"
+    exception_str = f" | Exception: {str(exception)}" if exception else ""
+    
+    log_line = f"[ERROR] Type: {error_type.value} | Token: {masked_token} | Endpoint: {endpoint_str} | {message}{exception_str}"
+    print(log_line)
+
+
+def should_retry_error(error_type: ErrorType) -> bool:
+    """Determine if an error type should trigger a retry with another account"""
+    return error_type in [
+        ErrorType.AUTH_ERROR,
+        ErrorType.RATE_LIMIT,
+        ErrorType.SERVER_ERROR,
+        ErrorType.NETWORK_ERROR,
+        ErrorType.UNKNOWN_ERROR
+    ]
+
+
+def should_mark_invalid(error_type: ErrorType) -> bool:
+    """Determine if an error should mark the account as permanently invalid"""
+    return error_type == ErrorType.AUTH_ERROR
+
+
+def should_increment_error_count(error_type: ErrorType) -> bool:
+    """Determine if an error should increment the account's error count"""
+    return error_type in [
+        ErrorType.RATE_LIMIT,
+        ErrorType.SERVER_ERROR,
+        ErrorType.NETWORK_ERROR,
+        ErrorType.UNKNOWN_ERROR
+    ]
+
+
+def log_account_event(account: Optional[Dict[str, Any]], message: str):
+    """Log account-specific events with masked tokens"""
+    token = account.get("token") if account else None
+    masked_token = mask_token(token)
+    print(f"[ACCOUNT] Token {masked_token}: {message}")
+
+
+def set_account_cooldown(account: YuppAccount, cooldown_seconds: Optional[int] = None):
+    """Apply cooldown to an account, preventing selection until expiry"""
+    if cooldown_seconds is None:
+        cooldown_seconds = int(os.getenv("ERROR_COOLDOWN", "300"))
+    account["cooldown_until"] = time.time() + max(cooldown_seconds, 1)
+
+
+def mark_account_invalid(account: YuppAccount, reason: str):
+    """Permanently mark an account as invalid"""
+    account["is_valid"] = False
+    account["cooldown_until"] = float("inf")
+    log_account_event(account, f"Marked invalid: {reason}")
+
+
+def increment_account_error(account: YuppAccount):
+    """Increment error count for account"""
+    account["error_count"] += 1
+
+
+def reset_account_after_cooldown(account: YuppAccount):
+    """Reset account error state once cooldown finishes"""
+    account["error_count"] = 0
+    account["cooldown_until"] = 0
+    log_account_event(account, "Cooldown elapsed, account re-enabled")
+
+
+def build_error_detail(message: str, error_type: ErrorType, extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    detail = {"message": message, "type": error_type.value}
+    if extra:
+        detail.update(extra)
+    return detail
+
+
+def raise_tokens_unavailable(reason: str, failures: Optional[List[str]] = None):
+    extra = {"failures": failures} if failures else None
+    raise HTTPException(
+        status_code=503,
+        detail=build_error_detail(reason, ErrorType.SERVER_ERROR, extra),
+    )
+
+
 class YuppAccount(TypedDict):
     token: str
     is_valid: bool
     last_used: float
     error_count: int
+    cooldown_until: float
 
 
 VALID_CLIENT_KEYS: set = set()
@@ -179,6 +308,7 @@ def load_yupp_accounts():
                     "is_valid": True,
                     "last_used": 0,
                     "error_count": 0,
+                    "cooldown_until": 0,
                 }
             )
         print(
@@ -234,36 +364,42 @@ def load_yupp_models():
 
 
 def get_best_yupp_account() -> Optional[YuppAccount]:
-    """Get the best available Yupp account using a smart selection algorithm."""
+    """Get the best available Yupp account using enhanced rotation logic."""
     max_error_count = int(os.getenv("MAX_ERROR_COUNT", "3"))
-    error_cooldown = int(os.getenv("ERROR_COOLDOWN", "300"))
+    cooldown_seconds = int(os.getenv("ERROR_COOLDOWN", "300"))
 
     with account_rotation_lock:
         now = time.time()
-        valid_accounts = [
-            acc
-            for acc in YUPP_ACCOUNTS
-            if acc["is_valid"]
-            and (
-                acc["error_count"] < max_error_count
-                or now - acc["last_used"] > error_cooldown
-            )
-        ]
+        candidates: List[YuppAccount] = []
 
-        if not valid_accounts:
+        for account in YUPP_ACCOUNTS:
+            if not account["is_valid"]:
+                continue
+
+            cooldown_until = account.get("cooldown_until", 0)
+            if cooldown_until and cooldown_until > now:
+                continue
+
+            if account["error_count"] >= max_error_count:
+                if not cooldown_until or cooldown_until <= now:
+                    set_account_cooldown(account, cooldown_seconds)
+                    log_account_event(
+                        account,
+                        f"Reached max error count ({account['error_count']}), entering cooldown",
+                    )
+                continue
+
+            if cooldown_until and cooldown_until <= now and account["error_count"] > 0:
+                reset_account_after_cooldown(account)
+
+            candidates.append(account)
+
+        if not candidates:
             return None
 
-        # Reset error count for accounts that have been in cooldown
-        for acc in valid_accounts:
-            if (
-                acc["error_count"] >= max_error_count
-                and now - acc["last_used"] > error_cooldown
-            ):
-                acc["error_count"] = 0
-
         # Sort by last used (oldest first) and error count (lowest first)
-        valid_accounts.sort(key=lambda x: (x["last_used"], x["error_count"]))
-        account = valid_accounts[0]
+        candidates.sort(key=lambda x: (x["last_used"], x["error_count"]))
+        account = candidates[0]
         account["last_used"] = now
         return account
 
@@ -351,9 +487,13 @@ async def list_models_no_auth():
 
 
 def claim_yupp_reward(account: YuppAccount, reward_id: str):
-    """同步领取Yupp奖励"""
+    """同步领取Yupp奖励 with improved error handling"""
+    if not reward_id:
+        log_debug("No reward ID provided, skipping claim")
+        return None
+
     try:
-        log_debug(f"Claiming reward {reward_id}...")
+        log_debug(f"Claiming reward {reward_id[:16]}... for token {mask_token(account['token'])}")
         url = "https://yupp.ai/api/trpc/reward.claim?batch=1"
         payload = {"0": {"json": {"rewardId": reward_id}}}
         headers = {
@@ -363,14 +503,25 @@ def claim_yupp_reward(account: YuppAccount, reward_id: str):
             "Cookie": f"__Secure-yupp.session-token={account['token']}",
         }
         session = create_requests_session()
-        response = session.post(url, json=payload, headers=headers)
+        response = session.post(url, json=payload, headers=headers, timeout=10)
         response.raise_for_status()
         data = response.json()
         balance = data[0]["result"]["data"]["json"]["currentCreditBalance"]
-        print(f"Reward claimed successfully. New balance: {balance}")
+        print(f"[REWARD] Claimed successfully for token {mask_token(account['token'])}. New balance: {balance}")
         return balance
+    except requests.exceptions.Timeout as e:
+        log_error(ErrorType.NETWORK_ERROR, f"Reward claim timeout for reward {reward_id[:16]}...", 
+                  account['token'], "reward.claim", e)
+        return None
+    except requests.exceptions.HTTPError as e:
+        error_type = classify_error(e)
+        log_error(error_type, f"Reward claim HTTP error for reward {reward_id[:16]}...", 
+                  account['token'], "reward.claim", e)
+        return None
     except Exception as e:
-        print(f"Failed to claim reward {reward_id}. Error: {e}")
+        error_type = classify_error(e)
+        log_error(error_type, f"Reward claim failed for reward {reward_id[:16]}...", 
+                  account['token'], "reward.claim", e)
         return None
 
 
@@ -588,9 +739,24 @@ def yupp_stream_generator(
         log_debug(f"Finished processing {line_count} lines")
 
     except Exception as e:
-        log_debug(f"Stream processing error: {e}")
-        print(f"Stream processing error: {e}")
-        yield f"data: {json.dumps({'error': str(e)})}\n\n"
+        error_type = (
+            ErrorType.NETWORK_ERROR
+            if isinstance(e, requests.exceptions.RequestException)
+            else ErrorType.STREAM_ERROR
+        )
+        message = (
+            "Upstream stream closed unexpectedly"
+            if error_type == ErrorType.NETWORK_ERROR
+            else "Stream processing error"
+        )
+        log_error(error_type, message, account.get("token"), "chat.stream", e)
+        error_payload = {
+            "error": {
+                "message": f"{message}: {str(e)[:200]}",
+                "type": error_type.value,
+            }
+        }
+        yield f"data: {json.dumps(error_payload)}\n\n"
 
     finally:
         # 发送完成信号
@@ -631,8 +797,20 @@ def build_yupp_non_stream_response(
             try:
                 data = json.loads(data_str)
                 if "error" in data:
+                    error_payload = data["error"]
+                    error_message = error_payload.get(
+                        "message", "Upstream stream reported an error."
+                    )
+                    error_value = error_payload.get(
+                        "type", ErrorType.STREAM_ERROR.value
+                    )
+                    error_type = next(
+                        (etype for etype in ErrorType if etype.value == error_value),
+                        ErrorType.STREAM_ERROR,
+                    )
                     raise HTTPException(
-                        status_code=500, detail=data["error"]["message"]
+                        status_code=500,
+                        detail=build_error_detail(error_message, error_type),
                     )
 
                 # 从第一个有效响应中获取模型名称（已经清理过）
@@ -668,7 +846,7 @@ def build_yupp_non_stream_response(
 async def chat_completions(
     request: ChatCompletionRequest, _: None = Depends(authenticate_client)
 ):
-    """使用Yupp.ai创建聊天完成"""
+    """使用Yupp.ai创建聊天完成 with enhanced error handling"""
     # 查找模型
     model_info = next((m for m in YUPP_MODELS if m.get("label") == request.model), None)
     if not model_info:
@@ -695,13 +873,41 @@ async def chat_completions(
     question = format_messages_for_yupp(request.messages)
     log_debug(f"Formatted question: {question[:100]}...")
 
+    if not YUPP_ACCOUNTS:
+        raise_tokens_unavailable(
+            "No Yupp.ai tokens configured on server. Please set YUPP_TOKENS.")
+
     # 尝试所有账户
+    failure_reasons: List[str] = []
+    request_timeout = float(os.getenv("YUPP_REQUEST_TIMEOUT", "45"))
+    endpoint_label = "chat.completions"
+
+    def record_failure(acc: YuppAccount, reason: str):
+        failure_reasons.append(f"{mask_token(acc['token'])}: {reason}")
+
     for attempt in range(len(YUPP_ACCOUNTS)):
         account = get_best_yupp_account()
         if not account:
-            raise HTTPException(
-                status_code=503, detail="No valid Yupp.ai accounts available."
+            all_invalid = all(not acc["is_valid"] for acc in YUPP_ACCOUNTS)
+            in_cooldown = sum(
+                1 for acc in YUPP_ACCOUNTS if acc.get("cooldown_until", 0) > time.time()
             )
+
+            if all_invalid:
+                raise_tokens_unavailable(
+                    "All upstream tokens are marked invalid (authentication failed). Please check token configuration.",
+                    failure_reasons,
+                )
+            elif in_cooldown > 0:
+                raise_tokens_unavailable(
+                    f"All upstream tokens temporarily unavailable ({in_cooldown} in cooldown due to errors). Please try again later.",
+                    failure_reasons,
+                )
+            else:
+                raise_tokens_unavailable(
+                    "No valid Yupp.ai accounts available. Please check configuration.",
+                    failure_reasons,
+                )
 
         try:
             # 构建请求
@@ -733,7 +939,7 @@ async def chat_completions(
             }
 
             log_debug(
-                f"Sending request to Yupp.ai with account token ending in ...{account['token'][-4:]}"
+                f"Sending request to Yupp.ai with account token ending in {mask_token(account['token'])}"
             )
 
             # 发送请求
@@ -743,6 +949,7 @@ async def chat_completions(
                 data=json.dumps(payload),
                 headers=headers,
                 stream=True,
+                timeout=request_timeout,
             )
             response.raise_for_status()
 
@@ -767,34 +974,91 @@ async def chat_completions(
                     response.iter_lines(), request.model, account
                 )
 
-        except requests.exceptions.HTTPError as e:
-            status_code = e.response.status_code
-            error_detail = e.response.text
-            print(f"Yupp.ai API error ({status_code}): {error_detail}")
+        except requests.exceptions.HTTPError as http_error:
+            status_code = http_error.response.status_code
+            error_type = classify_error(http_error)
+            log_error(
+                error_type,
+                f"Upstream HTTP error {status_code}",
+                account.get("token"),
+                endpoint_label,
+                http_error,
+            )
+            record_failure(account, f"http_{status_code}")
 
             with account_rotation_lock:
-                if status_code in [401, 403]:
-                    account["is_valid"] = False
-                    print(
-                        f"Account ...{account['token'][-4:]} marked as invalid due to auth error."
-                    )
-                elif status_code in [429, 500, 502, 503, 504]:
-                    account["error_count"] += 1
-                    print(
-                        f"Account ...{account['token'][-4:]} error count: {account['error_count']}"
-                    )
-                else:
-                    # 客户端错误，不尝试使用其他账户
-                    raise HTTPException(status_code=status_code, detail=error_detail)
+                if should_mark_invalid(error_type):
+                    mark_account_invalid(account, f"HTTP {status_code}")
+                elif should_increment_error_count(error_type):
+                    increment_account_error(account)
+                    set_account_cooldown(account)
 
-        except Exception as e:
-            print(f"Request error: {e}")
+            if error_type == ErrorType.CLIENT_ERROR:
+                raise HTTPException(
+                    status_code=status_code,
+                    detail=build_error_detail(
+                        "Yupp.ai rejected the request. Please validate your payload.",
+                        error_type,
+                        {"upstream_status": status_code},
+                    ),
+                )
+
+        except requests.exceptions.Timeout as timeout_error:
+            log_error(
+                ErrorType.NETWORK_ERROR,
+                "Request to Yupp.ai timed out",
+                account.get("token"),
+                endpoint_label,
+                timeout_error,
+            )
+            record_failure(account, "timeout")
             with account_rotation_lock:
-                account["error_count"] += 1
+                increment_account_error(account)
+                set_account_cooldown(account)
 
-    # 所有尝试都失败
-    raise HTTPException(
-        status_code=503, detail="All attempts to contact Yupp.ai API failed."
+        except requests.exceptions.ConnectionError as conn_error:
+            log_error(
+                ErrorType.NETWORK_ERROR,
+                "Network error contacting Yupp.ai",
+                account.get("token"),
+                endpoint_label,
+                conn_error,
+            )
+            record_failure(account, "connection_error")
+            with account_rotation_lock:
+                increment_account_error(account)
+                set_account_cooldown(account)
+
+        except requests.exceptions.RequestException as request_error:
+            error_type = classify_error(request_error)
+            log_error(
+                error_type,
+                "Unexpected requests exception calling Yupp.ai",
+                account.get("token"),
+                endpoint_label,
+                request_error,
+            )
+            record_failure(account, error_type.value)
+            with account_rotation_lock:
+                increment_account_error(account)
+                set_account_cooldown(account)
+
+        except Exception as unexpected_error:
+            log_error(
+                ErrorType.UNKNOWN_ERROR,
+                "Unexpected error while handling chat completion",
+                account.get("token"),
+                endpoint_label,
+                unexpected_error,
+            )
+            record_failure(account, "unexpected_error")
+            with account_rotation_lock:
+                increment_account_error(account)
+                set_account_cooldown(account, 60)
+
+    raise_tokens_unavailable(
+        "All attempts to contact Yupp.ai API failed. Please try again later.",
+        failure_reasons,
     )
 
 
