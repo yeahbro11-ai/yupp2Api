@@ -34,6 +34,26 @@
 cp env.example .env
 ```
 
+### 管理后台
+
+项目内置了一个简易的 Web 管理后台，路径为 `/admin`，用于查看服务状态、检查模型列表和快速发送测试请求。
+
+1. **启用方式**
+   - 在 `.env` 中设置 `ADMIN_DASHBOARD_TOKEN`（必填）。
+   - 可选：
+     - `APP_ENV_NAME`：展示在页面上的环境名称（如 `production`）。
+     - `APP_VERSION`：展示的版本号，便于区分部署版本。
+2. **访问方式**
+   - 访问 `https://<host>/admin?token=<ADMIN_DASHBOARD_TOKEN>`，服务会在浏览器 Cookie 中记住令牌。
+   - 或者通过 `Authorization: Bearer <ADMIN_DASHBOARD_TOKEN>` 请求头访问。
+3. **功能模块**
+   - **Dashboard**：入口页面，提供各模块的快捷导航。
+   - **Status**：显示应用名称、版本、环境、调试状态、运行时间、代理配置以及账户/模型统计。
+   - **Models**：读取 `model.json` 并以表格列出所有可用模型及标签信息。
+   - **Test Console**：提供一个表单，可直接向 `/v1/chat/completions` 发送非流式请求并在页面上查看 JSON 响应。
+
+> Admin token 仅用于保护 `/admin` 路由，与客户端使用的 `CLIENT_API_KEYS` 无关。
+
 ## 代理配置
 
 如果需要使用代理，在 `.env` 文件中设置：
